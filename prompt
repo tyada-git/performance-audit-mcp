@@ -1,0 +1,227 @@
+Can you use analyze_with_repo to audit http://localhost:5173/products
+and analyze my GitHub repo https://github.com/yourusername/yourrepo
+to give me file specific performance fixes?
+
+//example
+Got it. Running the audit now against your live app and repo simultaneously — this may take a moment.Here's a full breakdown of what's causing your **51/100 score** and exactly how to fix it, file by file, in priority order.
+
+---
+
+## 📊 Audit Summary
+
+| Metric      | Score      | Status        |
+| ----------- | ---------- | ------------- |
+| LCP         | 19.8s      | 🔴 Poor       |
+| FCP         | 10.6s      | 🔴 Poor       |
+| FID         | 260ms      | 🟡 Needs Work |
+| **Overall** | **51/100** | 🔴 Failing    |
+
+---
+
+## 🔥 Fix #1 — `vite.config.ts` — Biggest Impact
+
+**Problem:** Zero build optimization. No code splitting, no compression, no minification config. This alone accounts for **~3,800 KiB** of savings (text compression + unused JS + minification).
+
+```ts
+// vite.config.ts — BEFORE
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+});
+```
+
+```ts
+// vite.config.ts — AFTER
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  build: {
+    minify: "terser",
+    terserOptions: {
+      compress: { drop_console: true },
+    },
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ["react", "react-dom"],
+          redux: ["@reduxjs/toolkit", "react-redux"],
+          router: ["react-router-dom"],
+          styled: ["styled-components"],
+        },
+      },
+    },
+  },
+});
+```
+
+Also install and add gzip/brotli compression (handles the **2,576 KiB** text compression opportunity):
+
+```bash
+npm install -D vite-plugin-compression
+```
+
+```ts
+// add to plugins array:
+import viteCompression from 'vite-plugin-compression'
+// ...
+plugins: [react(), viteCompression({ algorithm: 'brotliCompress' })],
+```
+
+---
+
+## 🔥 Fix #2 — `src/App.tsx` — Kills LCP & FCP
+
+**Problem:** All 4 route components are **eagerly imported** at lines 2–6. Every byte of `ProductDetails`, `InventoryList`, and `ShowHistoryLogs` loads on the `/products` page even though they're never used there. This is a primary driver of your 10.6s FCP.
+
+```tsx
+// src/App.tsx — BEFORE (lines 1–6)
+import { Route, Routes } from "react-router-dom";
+import ProductList from "./features/products/components/ProductList";
+import Header from "./header";
+import ProductDetails from "./features/products/components/ProductDetails";
+import InventoryList from "./features/inventory/components/InventoryList";
+import ShowHistoryLogs from "./features/inventory/components/ShowHistoryLogs";
+```
+
+```tsx
+// src/App.tsx — AFTER
+import { lazy, Suspense } from "react";
+import { Route, Routes } from "react-router-dom";
+import Header from "./header";
+
+const ProductList = lazy(
+  () => import("./features/products/components/ProductList"),
+);
+const ProductDetails = lazy(
+  () => import("./features/products/components/ProductDetails"),
+);
+const InventoryList = lazy(
+  () => import("./features/inventory/components/InventoryList"),
+);
+const ShowHistoryLogs = lazy(
+  () => import("./features/inventory/components/ShowHistoryLogs"),
+);
+
+function App() {
+  return (
+    <>
+      <Header />
+      <Suspense fallback={<div>Loading...</div>}>
+        <Routes>
+          <Route path="/products" element={<ProductList />} />
+          <Route path="/products/:id" element={<ProductDetails />} />
+          <Route path="/inventory" element={<InventoryList />} />
+          <Route path="/inventory/:id/history" element={<ShowHistoryLogs />} />
+        </Routes>
+      </Suspense>
+    </>
+  );
+}
+```
+
+---
+
+## 🔥 Fix #3 — `src/main.tsx` — Fixes FID (260ms) & FCP
+
+**Problem (line 6 + lines 11–13):** `worker` is imported at the top level, so the **entire MSW library is always bundled**. Then `worker.start()` is called but **not awaited** before `createRoot().render()`. This causes a race condition where the app renders before the mock service worker is ready, leading to failed/re-fired requests that tank your FID.
+
+```tsx
+// src/main.tsx — BEFORE
+import { worker } from "./mocks/browser"; // ← eagerly bundles all of MSW
+// ...
+if (import.meta.env.MODE === "development") {
+  worker.start({ onUnhandledRequest: "bypass" }); // ← not awaited
+}
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>...</StrictMode>,
+);
+```
+
+```tsx
+// src/main.tsx — AFTER
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { Provider } from "react-redux";
+import App from "./App.tsx";
+import { store } from "./store.ts";
+import "./index.css";
+import { BrowserRouter } from "react-router-dom";
+
+// Dynamically import MSW only in dev — keeps it out of the production bundle
+async function enableMocking() {
+  if (import.meta.env.MODE !== "development") return;
+  const { worker } = await import("./mocks/browser");
+  return worker.start({ onUnhandledRequest: "bypass" });
+}
+
+// Await MSW before rendering to prevent race conditions
+enableMocking().then(() => {
+  createRoot(document.getElementById("root")!).render(
+    <StrictMode>
+      <Provider store={store}>
+        <BrowserRouter>
+          <App />
+        </BrowserRouter>
+      </Provider>
+    </StrictMode>,
+  );
+});
+```
+
+---
+
+## Fix #4 — `index.html` — Quick FCP Win
+
+**Problem:** No resource hints. The browser discovers `main.tsx` late in parsing.
+
+```html
+<!-- index.html — BEFORE <head> -->
+<title>product-dashboard</title>
+```
+
+```html
+<!-- index.html — AFTER, add inside <head> -->
+<title>product-dashboard</title>
+<link rel="modulepreload" href="/src/main.tsx" />
+```
+
+---
+
+## Fix #5 — `ProductList` / `ProductDetails` components (image fixes)
+
+The audit flagged **281 KiB** from offscreen images and **154 KiB** from non-next-gen formats. You'll need to apply these in whichever component renders your product images:
+
+```tsx
+// Wherever you render product <img> tags — BEFORE
+<img src={product.imageUrl} alt={product.name} />
+
+// AFTER — lazy load + explicit dimensions prevent layout shift (CLS)
+<img
+  src={product.imageUrl}
+  alt={product.name}
+  width={300}
+  height={200}
+  loading="lazy"
+  decoding="async"
+/>
+```
+
+For next-gen format support, serve `.webp` from your API/CDN, or use a `<picture>` element with a WebP source and a JPEG fallback.
+
+---
+
+## Priority Summary
+
+| Priority | File               | Change                                   | Estimated Saving         |
+| -------- | ------------------ | ---------------------------------------- | ------------------------ |
+| 1        | `vite.config.ts`   | Code splitting + compression + minify    | ~3,800 KiB               |
+| 2        | `src/App.tsx`      | Lazy-load all route components           | ~1,565 KiB               |
+| 3        | `src/main.tsx`     | Dynamic MSW import + await before render | Fixes FID race condition |
+| 4        | `index.html`       | `modulepreload` hint                     | FCP timing               |
+| 5        | Product components | `loading="lazy"` + WebP images           | ~435 KiB                 |
+
+Fixes 1–3 alone should get you from **51 → 80+**. Let me know if you'd like me to dig into any specific component file!
